@@ -1,0 +1,11 @@
+[project]
+name = "align"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dearpygui>=2.0.0",
+    "pathspec>=0.12.1",
+    "watchdog>=6.0.0",
+]
