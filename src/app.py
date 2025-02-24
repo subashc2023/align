@@ -360,6 +360,34 @@ def remove_repository(sender, app_data, user_data):
         logger.error(f"Failed to remove repository: {e}")
         dpg.configure_item("status_text", default_value=f"Error: {str(e)}")
 
+def ensure_align_in_gitignore(directory: str) -> None:
+    """Ensure Align.md is listed in .gitignore if the file exists."""
+    gitignore_path = os.path.join(directory, '.gitignore')
+    align_entry = 'Align.md'
+    
+    try:
+        # Check if .gitignore exists
+        if os.path.exists(gitignore_path):
+            # Read existing content
+            with open(gitignore_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+            # Check if Align.md is already in .gitignore
+            if align_entry not in content.split('\n'):
+                # Add Align.md to .gitignore with a newline before it
+                with open(gitignore_path, 'a', encoding='utf-8') as f:
+                    if not content.endswith('\n'):
+                        f.write('\n')
+                    f.write(f'# Added by Align\n{align_entry}\n')
+                logger.info(f"Added {align_entry} to .gitignore in {directory}")
+        else:
+            # Create .gitignore with Align.md
+            with open(gitignore_path, 'w', encoding='utf-8') as f:
+                f.write(f'# Created by Align\n{align_entry}\n')
+            logger.info(f"Created .gitignore with {align_entry} in {directory}")
+    except Exception as e:
+        logger.warning(f"Could not modify .gitignore in {directory}: {e}")
+
 def refresh_repo(sender=None, app_data=None, user_data=None, show_preview=False):
     """Refresh the Align.md file for a specific repository."""
     path = user_data  # Get the path from user_data
@@ -369,6 +397,9 @@ def refresh_repo(sender=None, app_data=None, user_data=None, show_preview=False)
 
     logger.info(f"Starting refresh for repository: {path}")
     try:
+        # Ensure Align.md is in .gitignore before proceeding
+        ensure_align_in_gitignore(path)
+        
         gitignore_spec = load_gitignore(path)
         
         # Calculate new hash
@@ -410,57 +441,123 @@ def refresh_repo(sender=None, app_data=None, user_data=None, show_preview=False)
         return False
 
 def refresh_all_repos(sender=None, app_data=None, user_data=None):
-    """Refresh all tracked repositories."""
+    """Refresh only repositories that need updating."""
     try:
         repos = Config.load_repos()
-        logger.info(f"Starting refresh of {len(repos)} repositories")
+        logger.info(f"Checking {len(repos)} repositories for updates")
         
-        # Track which repos have been processed to avoid duplicates
-        processed_repos = set()
+        # Track which repos need updates
+        repos_to_update = []
         
-        # Mark all repos as refreshing
+        # Check which repos need updates
         for repo in repos:
-            if repo in processed_repos:
-                logger.warning(f"Skipping duplicate repository: {repo}")
-                continue
-                
+            if repo in repo_watcher.observers:
+                handler = repo_watcher.observers[repo].event_handler
+                # Only add repos that are out of sync
+                if handler.current_hash != handler.saved_hash:
+                    repos_to_update.append(repo)
+        
+        if not repos_to_update:
+            status_msg = "All repositories are up to date"
+            logger.info(status_msg)
+            dpg.configure_item("status_text", default_value=status_msg)
+            return
+        
+        logger.info(f"Found {len(repos_to_update)} repositories needing updates")
+        
+        # Mark selected repos as refreshing
+        for repo in repos_to_update:
             if repo in repo_watcher.observers:
                 repo_watcher.observers[repo].event_handler.is_refreshing = True
-            processed_repos.add(repo)
-            
-        update_repo_list()  # Initial UI update to show all repos refreshing
         
-        # Refresh all repos
-        total_repos = len(repos)
+        update_repo_list()  # Initial UI update to show refreshing status
+        
+        # Refresh out-of-date repos
         successful_refreshes = 0
         
-        for i, repo in enumerate(repos, 1):
-            if repo in processed_repos:
-                logger.info(f"Processing repository {i}/{total_repos}: {repo}")
-                
-                if refresh_repo(None, None, repo, show_preview=False):
-                    successful_refreshes += 1
-                
-                # Update is_refreshing status after each repo
-                if repo in repo_watcher.observers:
-                    handler = repo_watcher.observers[repo].event_handler
-                    handler.is_refreshing = False
-                    # Update current hash and refresh time
-                    handler.current_hash = calculate_repo_hash(repo)
-                    handler.last_refresh = time.time()
-                
-                # Only update UI every few repos or on the last one
-                if i == total_repos or i % 3 == 0:
-                    update_repo_list()  # Update UI less frequently
+        for i, repo in enumerate(repos_to_update, 1):
+            logger.info(f"Processing repository {i}/{len(repos_to_update)}: {repo}")
+            
+            if refresh_repo(None, None, repo, show_preview=False):
+                successful_refreshes += 1
+            
+            # Update is_refreshing status after each repo
+            if repo in repo_watcher.observers:
+                handler = repo_watcher.observers[repo].event_handler
+                handler.is_refreshing = False
+                # Update current hash and refresh time
+                handler.current_hash = calculate_repo_hash(repo)
+                handler.last_refresh = time.time()
+            
+            # Only update UI every few repos or on the last one
+            if i == len(repos_to_update) or i % 3 == 0:
+                update_repo_list()
         
         # Final UI update and status message
         update_repo_list()
-        status_msg = f"Refreshed {successful_refreshes}/{total_repos} repositories"
+        status_msg = f"Realigned {successful_refreshes}/{len(repos_to_update)} repositories"
         logger.info(status_msg)
         dpg.configure_item("status_text", default_value=status_msg)
         
     except Exception as e:
-        error_msg = f"Error during refresh all: {str(e)}"
+        error_msg = f"Error during realign: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        dpg.configure_item("status_text", default_value=error_msg)
+
+def refresh_selected_repos(sender=None, app_data=None, user_data=None):
+    """Refresh only the selected repositories."""
+    try:
+        repos = Config.load_repos()
+        selected_repos = []
+        
+        # Get selected repositories
+        for repo in repos:
+            checkbox_tag = f"select_{hash(repo)}"
+            if dpg.does_item_exist(checkbox_tag) and dpg.get_value(checkbox_tag):
+                selected_repos.append(repo)
+        
+        if not selected_repos:
+            status_msg = "No repositories selected"
+            logger.info(status_msg)
+            dpg.configure_item("status_text", default_value=status_msg)
+            return
+        
+        logger.info(f"Processing {len(selected_repos)} selected repositories")
+        
+        # Mark selected repos as refreshing
+        for repo in selected_repos:
+            if repo in repo_watcher.observers:
+                repo_watcher.observers[repo].event_handler.is_refreshing = True
+        
+        update_repo_list()  # Initial UI update to show refreshing status
+        
+        # Refresh selected repos
+        successful_refreshes = 0
+        
+        for i, repo in enumerate(selected_repos, 1):
+            logger.info(f"Processing repository {i}/{len(selected_repos)}: {repo}")
+            
+            if refresh_repo(None, None, repo, show_preview=False):
+                successful_refreshes += 1
+            
+            # Update is_refreshing status after each repo
+            if repo in repo_watcher.observers:
+                handler = repo_watcher.observers[repo].event_handler
+                handler.is_refreshing = False
+                # Update current hash and refresh time
+                handler.current_hash = calculate_repo_hash(repo)
+                handler.last_refresh = time.time()
+            
+            update_repo_list()
+        
+        # Final UI update and status message
+        update_repo_list()
+        status_msg = f"Realigned {successful_refreshes}/{len(selected_repos)} repositories"
+        logger.info(status_msg)
+        dpg.configure_item("status_text", default_value=status_msg)
+        
+    except Exception as e:
+        error_msg = f"Error during realign: {str(e)}"
         logger.error(error_msg, exc_info=True)
         dpg.configure_item("status_text", default_value=error_msg)
 
@@ -494,15 +591,9 @@ def create_repo_list():
         # Create a group for this repo with a unique tag
         group_tag = f"repo_group_{hash(repo)}"
         with dpg.group(parent="repo_list", horizontal=True, tag=group_tag):
-            # Status indicator with tooltip
-            status_tag = f"status_{hash(repo)}"
-            dpg.add_text("\uf111", color=(128, 128, 128), tag=status_tag)  # fa-circle
-            dpg.bind_item_font(dpg.last_item(), icon_font)
-            
-            # Add tooltip with tag
-            tooltip_tag = f"tooltip_{hash(repo)}"
-            with dpg.tooltip(status_tag, tag=tooltip_tag):
-                dpg.add_text("Loading status...", tag=f"tooltip_text_{hash(repo)}")
+            # Add checkbox for selection
+            checkbox_tag = f"select_{hash(repo)}"
+            dpg.add_checkbox(tag=checkbox_tag)
             
             # Add buttons with icons
             dpg.add_button(
@@ -520,6 +611,16 @@ def create_repo_list():
                 width=30
             )
             dpg.bind_item_font(dpg.last_item(), icon_font)
+            
+            # Status indicator with tooltip
+            status_tag = f"status_{hash(repo)}"
+            dpg.add_text("\uf111", color=(128, 128, 128), tag=status_tag)  # fa-circle
+            dpg.bind_item_font(dpg.last_item(), icon_font)
+            
+            # Add tooltip with tag
+            tooltip_tag = f"tooltip_{hash(repo)}"
+            with dpg.tooltip(status_tag, tag=tooltip_tag):
+                dpg.add_text("Loading status...", tag=f"tooltip_text_{hash(repo)}")
             
             dpg.add_spacer(width=10)
             dpg.add_text(repo, wrap=0)
@@ -596,35 +697,18 @@ def main():
         height=500,
         modal=True,
         default_path=os.path.expanduser("~"),
-        label="Select Repository Directory",
-        tag="file_dialog_tag"
+        label="Select Repository Directory"
     ):
-        # Add informative text and help
-        with dpg.group(horizontal=True):
-            dpg.add_text("📁")  # Folder emoji
-            dpg.add_text("Select a repository directory to track")
-        
-        # Add quick access buttons for common locations
-        with dpg.group(horizontal=True):
-            dpg.add_button(label="Home", callback=lambda: dpg.set_value("file_dialog_tag", os.path.expanduser("~")))
-            dpg.add_button(label="Desktop", callback=lambda: dpg.set_value("file_dialog_tag", os.path.join(os.path.expanduser("~"), "Desktop")))
-            dpg.add_button(label="Documents", callback=lambda: dpg.set_value("file_dialog_tag", os.path.join(os.path.expanduser("~"), "Documents")))
-        
+        # Simple header text
+        dpg.add_text("Select a repository directory to track")
         dpg.add_separator()
         
-        # Add file type filters
-        with dpg.group():
-            dpg.add_checkbox(label="Show Hidden Files", callback=lambda sender, app_data: dpg.configure_item("file_dialog_tag", show_hidden=app_data))
-            dpg.add_checkbox(label="Show Only Directories", default_value=True, enabled=False)
-        
-        dpg.add_separator()
-        
-        # Add help text at the bottom
+        # Simple help text
         with dpg.group():
             dpg.add_text("Tips:", color=(255, 255, 0))
             dpg.add_text("• Double-click a folder to open it")
-            dpg.add_text("• Press Enter to select current directory")
-            dpg.add_text("• Use backspace to go up one level")
+            dpg.add_text("• Click OK to select current directory")
+            dpg.add_text("• Use .. to go up one level")
 
     # Create main application window
     with dpg.window(
@@ -640,11 +724,20 @@ def main():
                 callback=lambda: dpg.show_item("file_dialog"),
                 width=UI_CONSTANTS['BUTTON_WIDTH']
             )
-            dpg.add_button(
-                label="Refresh All",
-                callback=refresh_all_repos,
-                width=UI_CONSTANTS['BUTTON_WIDTH']
-            )
+            
+            # Add Realign group with two buttons
+            with dpg.group(horizontal=True):
+                dpg.add_text("Realign:")
+                dpg.add_button(
+                    label="ALL",
+                    callback=refresh_all_repos,
+                    width=50
+                )
+                dpg.add_button(
+                    label="Selected",
+                    callback=refresh_selected_repos,
+                    width=80
+                )
         
         dpg.add_separator()
         dpg.add_text("Tracked Repositories:")
