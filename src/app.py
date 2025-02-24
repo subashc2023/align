@@ -16,6 +16,7 @@ import logging
 from enum import Enum
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
+from config import config, ConfigError
 
 # Configure logging
 logging.basicConfig(
@@ -29,10 +30,6 @@ class AlignError(Exception):
     """Base exception for Align application."""
     pass
 
-class ConfigError(AlignError):
-    """Configuration related errors."""
-    pass
-
 class RepoStatus(Enum):
     """Repository status indicators."""
     UPDATING = ("Currently updating", "\uf021", (255, 165, 0))  # Orange refresh
@@ -43,42 +40,6 @@ class RepoStatus(Enum):
         self.description = description
         self.icon = icon
         self.color = color
-
-class Config:
-    """Configuration management class."""
-    CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".align_config.json")
-    
-    @classmethod
-    def load_repos(cls) -> List[str]:
-        """Load tracked repositories from config file."""
-        if os.path.exists(cls.CONFIG_PATH):
-            try:
-                with open(cls.CONFIG_PATH, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.error(f"Error loading config: {e}")
-                raise ConfigError(f"Failed to load config: {e}")
-        return []
-    
-    @classmethod
-    def save_repos(cls, repos: List[str]) -> None:
-        """Save tracked repositories to config file."""
-        try:
-            with open(cls.CONFIG_PATH, 'w') as f:
-                json.dump(repos, f)
-        except Exception as e:
-            logger.error(f"Error saving config: {e}")
-            raise ConfigError(f"Failed to save config: {e}")
-
-# UI Constants
-UI_CONSTANTS = {
-    'WINDOW_WIDTH': 800,
-    'WINDOW_HEIGHT': 600,
-    'BUTTON_WIDTH': 120,
-    'PREVIEW_WIDTH': 600,
-    'PREVIEW_HEIGHT': 600,
-    'REFRESH_COOLDOWN': 1.0,  # seconds
-}
 
 def load_gitignore(directory):
     """Load and parse .gitignore file."""
@@ -117,6 +78,8 @@ def view_repo(sender, app_data, user_data):
     """Show the Align.md content in a new window."""
     try:
         content = load_align_content(user_data)
+        if not content:
+            content = "No content available"
         
         # Create a unique tag for this window
         window_tag = f"preview_window_{hash(user_data)}"
@@ -128,22 +91,22 @@ def view_repo(sender, app_data, user_data):
         # Create new window
         with dpg.window(
             label=f"Preview: {os.path.basename(user_data)}",
-            width=600,
-            height=600,
+            width=config.ui.PREVIEW_WIDTH,
+            height=config.ui.PREVIEW_HEIGHT,
             pos=[100, 100],
             tag=window_tag
         ):
-            dpg.add_input_text(
+            # Add text widget with appropriate configuration
+            dpg.add_text(
                 default_value=content,
-                width=-1,
-                height=-1,
-                multiline=True,
-                readonly=True,
                 wrap=0,
                 tag=f"preview_text_{window_tag}"
             )
+            
     except Exception as e:
-        print(f"Error showing preview for {user_data}: {e}")
+        error_msg = f"Error showing preview for {user_data}: {e}"
+        logger.error(error_msg, exc_info=True)
+        dpg.configure_item("status_text", default_value=error_msg)
 
 def format_time_ago(timestamp):
     """Format timestamp as relative time."""
@@ -222,12 +185,36 @@ def calculate_repo_hash(directory):
     
     return sha256_hash.hexdigest()
 
+def store_hash_in_metadata(file_path: str, hash_value: str) -> bool:
+    """Store hash in file metadata using NTFS alternate data stream."""
+    try:
+        ads_path = f"{file_path}:align_hash"
+        with open(ads_path, 'w', encoding='utf-8') as f:
+            f.write(hash_value)
+        logger.debug(f"Stored hash {hash_value[:8]} in metadata for {file_path}")
+        return True
+    except Exception as e:
+        logger.warning(f"Could not store hash in metadata for {file_path}: {e}")
+        return False
+
+def read_hash_from_metadata(file_path: str) -> Optional[str]:
+    """Read hash from file metadata using NTFS alternate data stream."""
+    try:
+        ads_path = f"{file_path}:align_hash"
+        with open(ads_path, 'r', encoding='utf-8') as f:
+            hash_value = f.read().strip()
+            logger.debug(f"Read hash {hash_value[:8]} from metadata for {file_path}")
+            return hash_value
+    except Exception as e:
+        logger.debug(f"Could not read hash from metadata for {file_path}: {e}")
+        return None
+
 class RepoChangeHandler(FileSystemEventHandler):
     """Handler for file system changes in repositories."""
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
         self.last_refresh = 0
-        self.refresh_cooldown = UI_CONSTANTS['REFRESH_COOLDOWN']
+        self.refresh_cooldown = config.ui.REFRESH_COOLDOWN
         self.is_refreshing = False
         try:
             self.current_hash = calculate_repo_hash(repo_path)
@@ -238,24 +225,19 @@ class RepoChangeHandler(FileSystemEventHandler):
             raise AlignError(f"Failed to initialize repository handler: {e}")
 
     def load_saved_hash(self) -> Optional[str]:
-        """Load the saved hash from Align.md if it exists."""
+        """Load the saved hash from metadata if it exists."""
         align_path = os.path.join(self.repo_path, "Align.md")
-        try:
-            with open(align_path, "r", encoding="utf-8") as f:
-                first_line = f.readline().strip()
-                if first_line.startswith("<!-- Hash: "):
-                    hash_value = first_line[10:-3]
-                    logger.debug(f"Loaded saved hash {hash_value[:8]} from {align_path}")
-                    return hash_value
-        except Exception as e:
-            logger.warning(f"Could not load saved hash from {align_path}: {e}")
-        return None
+        return read_hash_from_metadata(align_path)
 
     def update_saved_hash(self) -> None:
-        """Update the saved hash in Align.md."""
+        """Update the saved hash in metadata."""
         old_hash = self.saved_hash and self.saved_hash[:8]
         self.saved_hash = self.current_hash
-        logger.debug(f"Updated saved hash from {old_hash} to {self.current_hash[:8]}")
+        align_path = os.path.join(self.repo_path, "Align.md")
+        if store_hash_in_metadata(align_path, self.current_hash):
+            logger.debug(f"Updated saved hash from {old_hash} to {self.current_hash[:8]}")
+        else:
+            logger.warning(f"Failed to update hash in metadata")
 
     def on_any_event(self, event) -> None:
         """Handle any file system event."""
@@ -275,17 +257,17 @@ class RepoChangeHandler(FileSystemEventHandler):
             logger.info(f"Processing {event.event_type} event for {event.src_path}")
             self.last_refresh = current_time
             self.is_refreshing = True
-            update_repo_list()  # Update UI to show refreshing status
+            repo_ui.update_repo_list()  # Update UI to show refreshing status
             
             refresh_repo(None, None, self.repo_path, show_preview=False)
             
             self.is_refreshing = False
-            update_repo_list()  # Update UI to show new status
+            repo_ui.update_repo_list()  # Update UI to show new status
             logger.info(f"Completed processing {event.event_type} event")
         except Exception as e:
             logger.error(f"Error handling file system event in {self.repo_path}: {e}", exc_info=True)
             self.is_refreshing = False
-            update_repo_list()
+            repo_ui.update_repo_list()
 
 class RepoWatcher:
     """Manages file system observers for all repositories."""
@@ -329,17 +311,19 @@ def add_repository(sender, app_data, user_data):
         return
 
     try:
-        repos = Config.load_repos()
+        repos = config.load_repos()
         if folder_path not in repos:
             repos.append(folder_path)
-            Config.save_repos(repos)
+            config.save_repos(repos)
             
             # Generate initial Align.md without preview
             refresh_repo(None, None, folder_path, show_preview=False)
             # Start watching the new repository
             repo_watcher.watch_repo(folder_path)
-            # Recreate the repository list
-            create_repo_list()
+            
+            # Add new repository to the list without recreating everything
+            repo_ui.create_repo_entry(folder_path)
+            
     except ConfigError as e:
         logger.error(f"Failed to add repository: {e}")
         dpg.configure_item("status_text", default_value=f"Error: {str(e)}")
@@ -348,14 +332,18 @@ def remove_repository(sender, app_data, user_data):
     """Remove a repository from tracking."""
     repo_path = user_data
     try:
-        repos = Config.load_repos()
+        repos = config.load_repos()
         if repo_path in repos:
             repos.remove(repo_path)
-            Config.save_repos(repos)
+            config.save_repos(repos)
             # Stop watching the repository
             repo_watcher.unwatch_repo(repo_path)
-            # Recreate the repository list
-            create_repo_list()
+            
+            # Remove just this repository's UI elements
+            group_tag = f"repo_group_{hash(repo_path)}"
+            if dpg.does_item_exist(group_tag):
+                dpg.delete_item(group_tag)
+            
     except ConfigError as e:
         logger.error(f"Failed to remove repository: {e}")
         dpg.configure_item("status_text", default_value=f"Error: {str(e)}")
@@ -412,14 +400,17 @@ def refresh_repo(sender=None, app_data=None, user_data=None, show_preview=False)
             logger.info(f"No changes detected for {path}, skipping refresh")
             return True
         
-        # Generate markdown with hash
+        # Generate markdown
         logger.debug(f"Generating markdown for {path}")
-        markdown_content = f"<!-- Hash: {new_hash} -->\n" + generate_markdown(path, gitignore_spec)
+        markdown_content = generate_markdown(path, gitignore_spec)
         
         align_file_path = os.path.join(path, "Align.md")
         with open(align_file_path, "w", encoding="utf-8") as f:
             f.write(markdown_content)
         logger.info(f"Updated Align.md at {align_file_path}")
+        
+        # Store hash in metadata
+        store_hash_in_metadata(align_file_path, new_hash)
         
         # Update handler's hashes
         if handler:
@@ -440,157 +431,153 @@ def refresh_repo(sender=None, app_data=None, user_data=None, show_preview=False)
         dpg.configure_item("status_text", default_value=f"Error refreshing {os.path.basename(path)}")
         return False
 
-def refresh_all_repos(sender=None, app_data=None, user_data=None):
-    """Refresh only repositories that need updating."""
+def _refresh_repositories(repos_to_refresh: List[str], description: str = "repositories") -> None:
+    """
+    Internal function to handle repository refresh logic.
+    
+    Args:
+        repos_to_refresh: List of repository paths to refresh
+        description: Description of the repositories being refreshed (for logging)
+    """
     try:
-        repos = Config.load_repos()
-        logger.info(f"Checking {len(repos)} repositories for updates")
-        
-        # Track which repos need updates
-        repos_to_update = []
-        
-        # Check which repos need updates
-        for repo in repos:
-            if repo in repo_watcher.observers:
-                handler = repo_watcher.observers[repo].event_handler
-                # Only add repos that are out of sync
-                if handler.current_hash != handler.saved_hash:
-                    repos_to_update.append(repo)
-        
-        if not repos_to_update:
-            status_msg = "All repositories are up to date"
+        if not repos_to_refresh:
+            status_msg = f"No {description} to update"
             logger.info(status_msg)
             dpg.configure_item("status_text", default_value=status_msg)
             return
         
-        logger.info(f"Found {len(repos_to_update)} repositories needing updates")
+        logger.info(f"Processing {len(repos_to_refresh)} {description}")
         
-        # Mark selected repos as refreshing
-        for repo in repos_to_update:
+        # Mark repos as refreshing
+        for repo in repos_to_refresh:
             if repo in repo_watcher.observers:
-                repo_watcher.observers[repo].event_handler.is_refreshing = True
+                handler = repo_watcher.observers[repo].event_handler
+                handler.is_refreshing = True
         
-        update_repo_list()  # Initial UI update to show refreshing status
+        repo_ui.update_repo_list()  # Initial UI update
         
-        # Refresh out-of-date repos
+        # Refresh repos
         successful_refreshes = 0
         
-        for i, repo in enumerate(repos_to_update, 1):
-            logger.info(f"Processing repository {i}/{len(repos_to_update)}: {repo}")
+        for i, repo in enumerate(repos_to_refresh, 1):
+            logger.info(f"Processing repository {i}/{len(repos_to_refresh)}: {repo}")
             
             if refresh_repo(None, None, repo, show_preview=False):
                 successful_refreshes += 1
             
-            # Update is_refreshing status after each repo
+            # Update status after each repo
             if repo in repo_watcher.observers:
                 handler = repo_watcher.observers[repo].event_handler
                 handler.is_refreshing = False
-                # Update current hash and refresh time
                 handler.current_hash = calculate_repo_hash(repo)
                 handler.last_refresh = time.time()
             
-            # Only update UI every few repos or on the last one
-            if i == len(repos_to_update) or i % 3 == 0:
-                update_repo_list()
+            # Update UI periodically
+            if i == len(repos_to_refresh) or i % 3 == 0:
+                repo_ui.update_repo_list()
         
-        # Final UI update and status message
-        update_repo_list()
-        status_msg = f"Realigned {successful_refreshes}/{len(repos_to_update)} repositories"
+        # Final update
+        repo_ui.update_repo_list()
+        status_msg = f"Realigned {successful_refreshes}/{len(repos_to_refresh)} {description}"
         logger.info(status_msg)
         dpg.configure_item("status_text", default_value=status_msg)
         
     except Exception as e:
-        error_msg = f"Error during realign: {str(e)}"
+        error_msg = f"Error during realign of {description}: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        dpg.configure_item("status_text", default_value=error_msg)
+
+def refresh_all_repos(sender=None, app_data=None, user_data=None):
+    """Refresh only repositories that need updating."""
+    try:
+        repos = config.load_repos()
+        repos_to_update = []
+        current_time = time.time()
+        
+        for repo in repos:
+            # Case 1: Repository not being watched yet
+            if repo not in repo_watcher.observers:
+                logger.info(f"Repository {repo} not being watched, will update")
+                repos_to_update.append(repo)
+                # Start watching the repository
+                repo_watcher.watch_repo(repo)
+                continue
+                
+            # Case 2: Repository being watched but needs update
+            handler = repo_watcher.observers[repo].event_handler
+            current_hash = calculate_repo_hash(repo)  # Get current hash
+            handler.current_hash = current_hash  # Update handler's current hash
+            
+            if current_hash != handler.saved_hash:
+                logger.info(f"Repository {repo} out of sync (hash mismatch), will update")
+                repos_to_update.append(repo)
+            else:
+                # Repository is up to date, update last_refresh time
+                logger.info(f"Repository {repo} is up to date")
+                handler.last_refresh = current_time
+        
+        # Update UI to show initial status
+        repo_ui.update_repo_list()
+        
+        if repos_to_update:
+            _refresh_repositories(repos_to_update, "out-of-date repositories")
+        else:
+            status_msg = "All repositories are up to date"
+            logger.info(status_msg)
+            dpg.configure_item("status_text", default_value=status_msg)
+            # Final UI update to show current status
+            repo_ui.update_repo_list()
+        
+    except Exception as e:
+        error_msg = f"Error preparing repositories for refresh: {str(e)}"
         logger.error(error_msg, exc_info=True)
         dpg.configure_item("status_text", default_value=error_msg)
 
 def refresh_selected_repos(sender=None, app_data=None, user_data=None):
     """Refresh only the selected repositories."""
     try:
-        repos = Config.load_repos()
-        selected_repos = []
-        
-        # Get selected repositories
-        for repo in repos:
-            checkbox_tag = f"select_{hash(repo)}"
-            if dpg.does_item_exist(checkbox_tag) and dpg.get_value(checkbox_tag):
-                selected_repos.append(repo)
-        
-        if not selected_repos:
-            status_msg = "No repositories selected"
-            logger.info(status_msg)
-            dpg.configure_item("status_text", default_value=status_msg)
-            return
-        
-        logger.info(f"Processing {len(selected_repos)} selected repositories")
-        
-        # Mark selected repos as refreshing
-        for repo in selected_repos:
-            if repo in repo_watcher.observers:
-                repo_watcher.observers[repo].event_handler.is_refreshing = True
-        
-        update_repo_list()  # Initial UI update to show refreshing status
-        
-        # Refresh selected repos
-        successful_refreshes = 0
-        
-        for i, repo in enumerate(selected_repos, 1):
-            logger.info(f"Processing repository {i}/{len(selected_repos)}: {repo}")
-            
-            if refresh_repo(None, None, repo, show_preview=False):
-                successful_refreshes += 1
-            
-            # Update is_refreshing status after each repo
-            if repo in repo_watcher.observers:
-                handler = repo_watcher.observers[repo].event_handler
-                handler.is_refreshing = False
-                # Update current hash and refresh time
-                handler.current_hash = calculate_repo_hash(repo)
-                handler.last_refresh = time.time()
-            
-            update_repo_list()
-        
-        # Final UI update and status message
-        update_repo_list()
-        status_msg = f"Realigned {successful_refreshes}/{len(selected_repos)} repositories"
-        logger.info(status_msg)
-        dpg.configure_item("status_text", default_value=status_msg)
+        repos = config.load_repos()
+        selected_repos = [
+            repo for repo in repos
+            if dpg.does_item_exist(f"select_{hash(repo)}") and 
+               dpg.get_value(f"select_{hash(repo)}")
+        ]
+        _refresh_repositories(selected_repos, "selected repositories")
         
     except Exception as e:
-        error_msg = f"Error during realign: {str(e)}"
+        error_msg = f"Error preparing selected repositories for refresh: {str(e)}"
         logger.error(error_msg, exc_info=True)
         dpg.configure_item("status_text", default_value=error_msg)
 
-def setup_icons():
-    """Setup font awesome icons"""
-    with dpg.font_registry():
-        try:
-            # Load from fonts directory
-            font_path = os.path.join(os.path.dirname(__file__), "fonts", "fa-solid-900.ttf")
-            if os.path.exists(font_path):
-                with dpg.font(font_path, 13) as font:
-                    dpg.add_font_range_hint(dpg.mvFontRangeHint_Default)
-                    dpg.add_font_range(0xf000, 0xf999)  # Font Awesome range
-                logger.info("Successfully loaded Font Awesome icons")
-                return font
-            else:
-                logger.warning(f"Font file not found at {font_path}")
+class RepositoryListUI:
+    """Handles UI components for repository list."""
+    
+    def __init__(self):
+        self.icon_font = None
+    
+    def setup_icons(self):
+        """Setup font awesome icons"""
+        with dpg.font_registry():
+            try:
+                font_path = os.path.join(os.path.dirname(__file__), "fonts", "fa-solid-900.ttf")
+                if os.path.exists(font_path):
+                    with dpg.font(font_path, 13) as font:
+                        dpg.add_font_range_hint(dpg.mvFontRangeHint_Default)
+                        dpg.add_font_range(0xf000, 0xf999)  # Font Awesome range
+                    logger.info("Successfully loaded Font Awesome icons")
+                    self.icon_font = font
+                    return font
+                else:
+                    logger.warning(f"Font file not found at {font_path}")
+                    return None
+            except Exception as e:
+                logger.error(f"Could not load icons: {e}", exc_info=True)
                 return None
-        except Exception as e:
-            logger.error(f"Could not load icons: {e}", exc_info=True)
-            return None
-
-def create_repo_list():
-    """Create the initial repository list."""
-    repos = Config.load_repos()
     
-    # Clear existing items
-    dpg.delete_item("repo_list", children_only=True)
-    
-    for repo in repos:
-        # Create a group for this repo with a unique tag
+    def create_repo_entry(self, repo: str, parent: str = "repo_list") -> None:
+        """Create UI elements for a single repository entry."""
         group_tag = f"repo_group_{hash(repo)}"
-        with dpg.group(parent="repo_list", horizontal=True, tag=group_tag):
+        with dpg.group(parent=parent, horizontal=True, tag=group_tag):
             # Add checkbox for selection
             checkbox_tag = f"select_{hash(repo)}"
             dpg.add_checkbox(tag=checkbox_tag)
@@ -602,7 +589,7 @@ def create_repo_list():
                 user_data=repo,
                 width=30
             )
-            dpg.bind_item_font(dpg.last_item(), icon_font)
+            dpg.bind_item_font(dpg.last_item(), self.icon_font)
             
             dpg.add_button(
                 label="\uf06e",  # eye icon
@@ -610,12 +597,12 @@ def create_repo_list():
                 user_data=repo,
                 width=30
             )
-            dpg.bind_item_font(dpg.last_item(), icon_font)
+            dpg.bind_item_font(dpg.last_item(), self.icon_font)
             
             # Status indicator with tooltip
             status_tag = f"status_{hash(repo)}"
             dpg.add_text("\uf111", color=(128, 128, 128), tag=status_tag)  # fa-circle
-            dpg.bind_item_font(dpg.last_item(), icon_font)
+            dpg.bind_item_font(dpg.last_item(), self.icon_font)
             
             # Add tooltip with tag
             tooltip_tag = f"tooltip_{hash(repo)}"
@@ -628,64 +615,74 @@ def create_repo_list():
             # Add timestamp text with tag
             time_tag = f"time_{hash(repo)}"
             dpg.add_text("", tag=time_tag, color=(128, 128, 128))
-
-def update_repo_list():
-    """Update only the status indicators and timestamps."""
-    try:
-        repos = Config.load_repos()
-        
+    
+    def create_repo_list(self):
+        """Create the initial repository list."""
+        repos = config.load_repos()
+        dpg.delete_item("repo_list", children_only=True)
         for repo in repos:
-            status_tag = f"status_{hash(repo)}"
-            tooltip_tag = f"tooltip_{hash(repo)}"
-            time_tag = f"time_{hash(repo)}"
-            
-            if not dpg.does_item_exist(status_tag):
-                continue
-                
-            # Get handler for this repo
-            handler = repo_watcher.observers.get(repo) and repo_watcher.observers[repo].event_handler
-            
-            # Update current hash
-            if handler:
-                handler.current_hash = calculate_repo_hash(repo)
-            
-            # Update status indicator
-            status = None
-            if handler and handler.is_refreshing:
-                status = RepoStatus.UPDATING
-            elif handler and handler.current_hash == handler.saved_hash:
-                status = RepoStatus.UP_TO_DATE
-            else:
-                status = RepoStatus.NEEDS_UPDATE
-            
-            dpg.configure_item(status_tag, default_value=status.icon, color=status.color)
-            
-            # Update tooltip text
-            tooltip_text = ("Status Indicator\n\n"
-                        "✓ Check: Content is up to date\n"
-                        "↻ Refresh: Currently updating\n"
-                        "⚠ Warning: Content needs updating\n\n"
-                        f"Current Status: {status.description}")
-            
-            tooltip_text_tag = f"tooltip_text_{hash(repo)}"
-            if dpg.does_item_exist(tooltip_text_tag):
-                dpg.configure_item(tooltip_text_tag, default_value=tooltip_text)
-            
-            # Update timestamp
-            if handler and handler.last_refresh:
-                time_ago = format_time_ago(handler.last_refresh)
-                dpg.configure_item(time_tag, default_value=f"(Updated: {time_ago})")
-    except ConfigError as e:
-        logger.error(f"Failed to update repository list: {e}")
-        dpg.configure_item("status_text", default_value=f"Error: {str(e)}")
+            self.create_repo_entry(repo)
+    
+    def update_repo_status(self, repo: str, handler: Optional[RepoChangeHandler]) -> None:
+        """Update status and timestamp for a single repository."""
+        status_tag = f"status_{hash(repo)}"
+        tooltip_tag = f"tooltip_{hash(repo)}"
+        time_tag = f"time_{hash(repo)}"
+        
+        if not dpg.does_item_exist(status_tag):
+            return
+        
+        # Update current hash if handler exists
+        if handler:
+            handler.current_hash = calculate_repo_hash(repo)
+        
+        # Update status indicator
+        status = None
+        if handler and handler.is_refreshing:
+            status = RepoStatus.UPDATING
+        elif handler and handler.current_hash == handler.saved_hash:
+            status = RepoStatus.UP_TO_DATE
+        else:
+            status = RepoStatus.NEEDS_UPDATE
+        
+        dpg.configure_item(status_tag, default_value=status.icon, color=status.color)
+        
+        # Update tooltip
+        tooltip_text = ("Status Indicator\n\n"
+                    "✓ Check: Content is up to date\n"
+                    "↻ Refresh: Currently updating\n"
+                    "⚠ Warning: Content needs updating\n\n"
+                    f"Current Status: {status.description}")
+        
+        tooltip_text_tag = f"tooltip_text_{hash(repo)}"
+        if dpg.does_item_exist(tooltip_text_tag):
+            dpg.configure_item(tooltip_text_tag, default_value=tooltip_text)
+        
+        # Update timestamp
+        if handler and handler.last_refresh:
+            time_ago = format_time_ago(handler.last_refresh)
+            dpg.configure_item(time_tag, default_value=f"(Updated: {time_ago})")
+    
+    def update_repo_list(self):
+        """Update status indicators and timestamps for all repositories."""
+        try:
+            repos = config.load_repos()
+            for repo in repos:
+                handler = repo_watcher.observers.get(repo) and repo_watcher.observers[repo].event_handler
+                self.update_repo_status(repo, handler)
+        except ConfigError as e:
+            logger.error(f"Failed to update repository list: {e}")
+            dpg.configure_item("status_text", default_value=f"Error: {str(e)}")
+
+# Create global UI instance
+repo_ui = RepositoryListUI()
 
 def main():
     """Initialize and run the Dear PyGUI application."""
     dpg.create_context()
     
-    # Setup icons first and make icon_font global
-    global icon_font
-    icon_font = setup_icons()
+    # Setup icons first
+    repo_ui.setup_icons()
     
     # Create file dialog for directory selection
     with dpg.file_dialog(
@@ -693,17 +690,15 @@ def main():
         show=False, 
         callback=add_repository, 
         id="file_dialog",
-        width=700,
-        height=500,
+        width=config.ui.FILE_DIALOG_WIDTH,
+        height=config.ui.FILE_DIALOG_HEIGHT,
         modal=True,
         default_path=os.path.expanduser("~"),
         label="Select Repository Directory"
     ):
-        # Simple header text
         dpg.add_text("Select a repository directory to track")
         dpg.add_separator()
         
-        # Simple help text
         with dpg.group():
             dpg.add_text("Tips:", color=(255, 255, 0))
             dpg.add_text("• Double-click a folder to open it")
@@ -713,8 +708,8 @@ def main():
     # Create main application window
     with dpg.window(
         label="Align - Repository Tracker",
-        width=UI_CONSTANTS['WINDOW_WIDTH'],
-        height=UI_CONSTANTS['WINDOW_HEIGHT'],
+        width=config.ui.WINDOW_WIDTH,
+        height=config.ui.WINDOW_HEIGHT,
         tag="primary_window"
     ):
         # Create main content
@@ -722,7 +717,7 @@ def main():
             dpg.add_button(
                 label="Add Repository",
                 callback=lambda: dpg.show_item("file_dialog"),
-                width=UI_CONSTANTS['BUTTON_WIDTH']
+                width=config.ui.BUTTON_WIDTH
             )
             
             # Add Realign group with two buttons
@@ -753,8 +748,8 @@ def main():
     # Setup viewport and start the application
     dpg.create_viewport(
         title="Align",
-        width=UI_CONSTANTS['WINDOW_WIDTH'],
-        height=UI_CONSTANTS['WINDOW_HEIGHT']
+        width=config.ui.WINDOW_WIDTH,
+        height=config.ui.WINDOW_HEIGHT
     )
     dpg.setup_dearpygui()
     dpg.show_viewport()
@@ -762,10 +757,10 @@ def main():
     
     try:
         # Load and display tracked repositories
-        repos = Config.load_repos()
+        repos = config.load_repos()
         for repo in repos:
             repo_watcher.watch_repo(repo)
-        create_repo_list()  # Create initial list
+        repo_ui.create_repo_list()  # Create initial list
         
         dpg.start_dearpygui()
     except Exception as e:
